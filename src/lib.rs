@@ -39,7 +39,7 @@
 //! let val = leb128::read::unsigned(&mut readable).expect("Should read number");
 //! assert_eq!(val, 98765);
 //! ```
-
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 
 #[doc(hidden)]
@@ -56,58 +56,75 @@ pub fn low_bits_of_byte(byte: u8) -> u8 {
 #[doc(hidden)]
 #[inline]
 pub fn low_bits_of_u64(val: u64) -> u8 {
-    let byte = val & (std::u8::MAX as u64);
+    let byte = val & (u8::MAX as u64);
     low_bits_of_byte(byte as u8)
 }
 
 /// A module for reading LEB128-encoded signed and unsigned integers.
 pub mod read {
     use super::{low_bits_of_byte, CONTINUATION_BIT, SIGN_BIT};
-    use std::fmt;
-    use std::io;
+    use core::fmt;
+    use embedded_io as io;
 
     /// An error type for reading LEB128-encoded values.
     #[derive(Debug)]
-    pub enum Error {
+    pub enum Error<E: io::Error> {
         /// There was an underlying IO error.
-        IoError(io::Error),
+        IoError(E),
         /// The number being read is larger than can be represented.
         Overflow,
+        /// The buffer is not large enough.
+        UnexpectedEof,
     }
 
-    impl From<io::Error> for Error {
-        fn from(e: io::Error) -> Self {
+    impl<E: io::Error> From<E> for Error<E> {
+        fn from(e: E) -> Self {
             Error::IoError(e)
         }
     }
 
-    impl fmt::Display for Error {
+    impl<E: io::Error> From<embedded_io::ReadExactError<E>> for Error<E> {
+        fn from(e: embedded_io::ReadExactError<E>) -> Self {
+            match e {
+                embedded_io::ReadExactError::UnexpectedEof => Error::UnexpectedEof,
+                embedded_io::ReadExactError::Other(e) => Error::IoError(e),
+            }
+        }
+    }
+
+    impl<E: io::Error> fmt::Display for Error<E> {
         fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
             match *self {
                 Error::IoError(ref e) => e.fmt(f),
                 Error::Overflow => {
                     write!(f, "The number being read is larger than can be represented")
                 }
+                Error::UnexpectedEof => {
+                    write!(f, "The buffer is not large enough")
+                }
             }
         }
     }
 
-    impl std::error::Error for Error {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match *self {
-                Error::IoError(ref e) => Some(e),
-                Error::Overflow => None,
-            }
-        }
-    }
+    // #[cfg(feature = "std")]
+    // impl<E: io::Error> std::error::Error for Error<E> {
+    //     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    //         match *self {
+    //             Error::IoError(ref e) => Some(e),
+    //             Error::UnexpectedEof => None,
+    //             Error::Overflow => None,
+    //         }
+    //     }
+    // }
 
     /// Read an unsigned LEB128-encoded number from the `std::io::Read` stream
     /// `r`.
     ///
     /// On success, return the number.
-    pub fn unsigned<R>(r: &mut R) -> Result<u64, Error>
+    pub fn unsigned<R, E>(r: &mut R) -> Result<u64, Error<E>>
     where
-        R: ?Sized + io::Read,
+        R: ?Sized + io::Read<Error = E>,
+        E: io::Error,
     {
         let mut result = 0;
         let mut shift = 0;
@@ -137,9 +154,10 @@ pub mod read {
     /// Read a signed LEB128-encoded number from the `std::io::Read` stream `r`.
     ///
     /// On success, return the number.
-    pub fn signed<R>(r: &mut R) -> Result<i64, Error>
+    pub fn signed<R, E>(r: &mut R) -> Result<i64, Error<E>>
     where
-        R: ?Sized + io::Read,
+        R: ?Sized + io::Read<Error = E>,
+        E: io::Error,
     {
         let mut result = 0;
         let mut shift = 0;
@@ -179,14 +197,15 @@ pub mod read {
 /// A module for writing LEB128-encoded signed and unsigned integers.
 pub mod write {
     use super::{low_bits_of_u64, CONTINUATION_BIT};
-    use std::io;
+    use embedded_io as io;
 
     /// Write `val` to the `std::io::Write` stream `w` as an unsigned LEB128 value.
     ///
     /// On success, return the number of bytes written to `w`.
-    pub fn unsigned<W>(w: &mut W, mut val: u64) -> Result<usize, io::Error>
+    pub fn unsigned<W, E>(w: &mut W, mut val: u64) -> Result<usize, E>
     where
-        W: ?Sized + io::Write,
+        W: ?Sized + io::Write<Error = E>,
+        E: io::Error,
     {
         let mut bytes_written = 0;
         loop {
@@ -210,9 +229,10 @@ pub mod write {
     /// Write `val` to the `std::io::Write` stream `w` as a signed LEB128 value.
     ///
     /// On success, return the number of bytes written to `w`.
-    pub fn signed<W>(w: &mut W, mut val: i64) -> Result<usize, io::Error>
+    pub fn signed<W, E>(w: &mut W, mut val: i64) -> Result<usize, E>
     where
-        W: ?Sized + io::Write,
+        W: ?Sized + io::Write<Error = E>,
+        E: io::Error,
     {
         let mut bytes_written = 0;
         loop {
@@ -243,7 +263,6 @@ pub mod write {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std;
     use std::io;
 
     #[test]
@@ -504,7 +523,7 @@ mod tests {
         for i in -513..513 {
             inner(i);
         }
-        inner(std::i64::MIN);
+        inner(i64::MIN);
     }
 
     #[test]
@@ -637,13 +656,10 @@ mod tests {
         ];
         let mut readable = &buf[..];
 
-        assert!(if let read::Error::Overflow =
-            read::unsigned(&mut readable).expect_err("Should fail with Error::Overflow")
-        {
-            true
-        } else {
-            false
-        });
+        assert!(matches!(
+            read::unsigned(&mut readable).expect_err("Should fail with Error::Overflow"),
+            read::Error::Overflow
+        ));
         assert_eq!(
             read::unsigned(&mut readable).expect("Should succeed with correct value"),
             45156
